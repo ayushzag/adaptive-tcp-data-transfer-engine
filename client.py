@@ -11,7 +11,7 @@ def recv_exact(sock, size):
 
     # Jab tak expected size ka data receive nahi ho jata tab tak receive karte raho.
     while len(data) < size:
-        chunk = sock.recv(size - len(data))
+        chunk = sock.recv(size - len(data)) #TCP thoda-thoda data de sakta hai, isliye loop.
 
         # Agar server ne connection close kar diya before complete data,
         # to connection properly complete nahi hua.

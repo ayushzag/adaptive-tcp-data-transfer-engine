@@ -1,5 +1,8 @@
 import socket
+import hashlib
+
 from protocol import unpack_header
+
 
 HOST = "127.0.0.1"  # local host - isi computer pr server chalega
 PORT = 5050
@@ -64,43 +67,84 @@ print(f"Connected by {address}")
 
 
 try:
-    # Day 2:
-    # Client sabse pehle 8-byte header bhejega.
-    # Header ke andar file ka total size hoga.
+
+    # -----------------------------------------
+    # STEP 1: Client ka 8-byte header receive karo
+    # -----------------------------------------
 
     header = recv_exact(client_socket, 8)
 
-    # Header ko bytes se actual file-size number mein convert kar rahe hain.
+    # Header khud bhi TCP stream mein split ho sakta hai,
+    # isliye direct recv(8) par depend nahi kar rahe.
+    # recv_exact() ensure karega ki exactly 8 bytes milen.
+
+
+    # -----------------------------------------
+    # STEP 2: Header se file size nikalo
+    # -----------------------------------------
+
     file_size = unpack_header(header)
 
     print(f"Incoming file size: {file_size} bytes")
 
 
-    # Ab actual file data receive karenge.
-    # TCP mein ek send() = ek recv() guaranteed nahi hota.
-    # Isliye chunks mein baar-baar receive karenge.
+    # -----------------------------------------
+    # STEP 3: File receive karo
+    # -----------------------------------------
 
     received = 0
 
+    file_hash = hashlib.sha256()
+    # Server bhi received file ka SHA-256 calculate karega.
+    # Baad mein client ke hash se compare kar sakte hain.
+
+
     with open("received.txt", "wb") as f:
         # "wb" = write binary
-        # File ko binary mode mein save kar rahe hain.
+        # Received data ko binary file ke form mein save kar rahe hain.
 
         while received < file_size:
 
-            # Sirf utna hi data maango jitna abhi remaining hai.
+            # Ab kitne bytes remaining hain?
             remaining = file_size - received
+
+            # Maximum 4096 bytes ek baar mein receive karo.
             chunk = client_socket.recv(min(4096, remaining))
+
 
             # Agar client ne file complete hone se pehle connection close kar diya.
             if not chunk:
-                raise ConnectionError("Client closed connection during file transfer")
+                raise ConnectionError(
+                    "Client closed connection during file transfer"
+                )
 
+
+            # Received chunk ko disk par write karo.
             f.write(chunk)
+
+
+            # Received chunk ko SHA-256 hash mein add karo.
+            file_hash.update(chunk)
+
+
+            # Total received bytes update karo.
             received += len(chunk)
+
 
             print(f"Received: {received}/{file_size} bytes")
 
+
+    # -----------------------------------------
+    # STEP 4: Final checksum nikalo
+    # -----------------------------------------
+
+    server_hash = file_hash.hexdigest()
+
+    print(f"Server SHA-256: {server_hash}")
+
+
+    # Day 2 mein checksum sirf calculate + log kar rahe hain.
+    # Actual integrity enforcement later Day 4 mein karenge.
 
     print("File received successfully")
 
@@ -113,4 +157,5 @@ except ConnectionError as e:
 finally:
     client_socket.close()
     server.close()
+
     print("Server closed")
