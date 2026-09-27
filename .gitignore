@@ -1,1 +1,4 @@
 test_large.bin
+
+transfers/
+__pycache__/

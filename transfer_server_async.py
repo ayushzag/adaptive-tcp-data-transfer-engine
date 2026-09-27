@@ -1,98 +1,452 @@
 import asyncio
-import hashlib
+import os #File ko rename/replace karne ke liye:
+from pathlib import Path #File paths ko cleanly handle karne ke liye:
 
-from protocol import unpack_header
+from protocol import (
+    PING,
+    PONG,
+    START_TRANSFER,
+
+    read_transfer_start,
+    pack_resume_offset,
+    read_final_hash,
+    pack_status,
+
+    pack_pong,
+
+    STATUS_OK,
+    STATUS_CHECKSUM_MISMATCH,
+    STATUS_INVALID_REQUEST,
+)
+
+from integrity import (
+    create_hasher,
+    update_hash,
+    get_digest,
+)
 
 
 HOST = "127.0.0.1"
 PORT = 5050
 
+CHUNK_SIZE = 4096
+
+TRANSFER_DIR = Path("transfers") #"Saari incoming transfer files transfers/ folder mein rakho."
+TRANSFER_DIR.mkdir(exist_ok=True)   #iska matlb hai ki agar transfers/ folder pehle se exist karta hai toh kuch nahi hoga, aur agar exist nahi karta toh ye folder create kar dega.
+
+
+# ============================================================
+# Transfer ID safety
+# ============================================================
+
+def sanitize_transfer_id(transfer_id):
+
+    safe_id = "".join(
+        c
+        for c in transfer_id
+        if c.isalnum() or c in "-_"
+    ) #Means ki transfer_id mein sirf alphanumeric characters aur '-' ya '_' allowed hain. Agar koi aur character hai toh wo remove ho jayega.
+
+    if not safe_id:
+        raise ValueError(
+            "Invalid transfer ID"
+        )
+
+    return safe_id[:64]
+
+
+def get_paths(transfer_id):
+
+    safe_id = sanitize_transfer_id(
+        transfer_id
+    )
+
+    part_path = (
+        TRANSFER_DIR
+        / f"{safe_id}.part"
+    )
+
+    final_path = (
+        TRANSFER_DIR
+        / f"{safe_id}.bin"
+    )
+
+    return part_path, final_path
+
+
+# ============================================================
+# Handle client
+# ============================================================
 
 async def handle_client(reader, writer):
-    peer = writer.get_extra_info("peername") #Ye client ka address/port nikal raha hai.
-    print(f"Client connected: {peer}")
+
+    peer = writer.get_extra_info( #Ye client ka address/port information nikaalta hai.
+        "peername"
+    )
+
+    print(
+        f"[{peer}] Client connected"
+    )
 
     try:
-        # -----------------------------------------
-        # STEP 1: Receive exact 8-byte header
-        # -----------------------------------------
 
-        header = await reader.readexactly(8) #8 bytes ka header receive kar rahe hain.
+        # ====================================================
+        # STEP 1: Read first message type
+        # ====================================================
 
-        # Header -> actual file size
-        file_size = unpack_header(header) #Header ke 8 bytes ke andar jo file size encoded tha, usko normal integer bana rahe hain.
+        first_byte = await reader.readexactly(1)
 
-        print(f"[{peer}] Incoming file size: {file_size} bytes")
+        message_type = first_byte[0]
 
-        # -----------------------------------------
-        # STEP 2: Receive file
-        # -----------------------------------------
+        # ====================================================
+        # DAY 5: RTT PING
+        # ====================================================
 
-        received = 0 #Ab tak kitne bytes aa chuke hain?
+        if message_type == PING:
 
-        file_hash = hashlib.sha256() #Jo bytes aaye hain unka SHA-256 continuously calculate karo.
-        output_file = f"received_{peer[1]}.txt" #Ye humne multiple clients ke test ke liye add kiya. Warna sab clients same received.txt ko overwrite kar sakte the.
+            writer.write(
+                pack_pong()
+            )
 
-        with open(output_file, "wb") as f: #wb = write binary mode. Kyunki file binary data ho sakta hai.
+            await writer.drain()
 
-            while received < file_size: #Jab tak poori expected file nahi aa jaati, receive karte raho.
+            print(
+                f"[{peer}] PING -> PONG"
+            )
 
-                remaining = file_size - received #Kitne bytes abhi bache hain?
+            # IMPORTANT:
+            # Do NOT close.
+            #
+            # Client will now send START_TRANSFER
+            # on the SAME TCP connection.
 
-                chunk = await reader.read( #4096 bytes ka chunk receive karo, ya jo bhi remaining hain, whichever is smaller.
-                    min(4096, remaining)
+            first_byte = await reader.readexactly(1)
+
+            message_type = first_byte[0]
+
+        # ====================================================
+        # STEP 2: Validate START_TRANSFER
+        # ====================================================
+
+        if message_type != START_TRANSFER:
+
+            raise ConnectionError(
+                "Expected START_TRANSFER message"
+            )
+
+        # Reconstruct the complete START_TRANSFER header.
+        transfer_id, file_size = (
+            await read_transfer_start(
+                reader,
+                first_byte=first_byte,
+            )
+        )
+
+        print(
+            f"[{peer}] Transfer ID: "
+            f"{transfer_id}"
+        )
+
+        print(
+            f"[{peer}] Expected size: "
+            f"{file_size} bytes"
+        )
+
+        part_path, final_path = get_paths(
+            transfer_id
+        )
+
+        # ====================================================
+        # STEP 3: Find existing partial transfer
+        # ====================================================
+
+        if part_path.exists():
+
+            existing_size = (
+                part_path.stat().st_size
+            )
+
+        else:
+
+            existing_size = 0
+
+        if existing_size > file_size:
+
+            print(
+                f"[{peer}] Existing .part file "
+                f"is larger than requested "
+                f"file. Resetting."
+            )
+
+            part_path.unlink()
+
+            existing_size = 0
+
+        print(
+            f"[{peer}] Resume offset: "
+            f"{existing_size} bytes"
+        )
+
+        # Tell client how many bytes we already have.
+        writer.write(
+            pack_resume_offset(
+                existing_size
+            )
+        )
+
+        await writer.drain()
+
+        # ====================================================
+        # STEP 4: Prepare SHA-256
+        # ====================================================
+
+        hasher = create_hasher()
+
+        # Existing partial file must be part of
+        # final SHA-256 calculation.
+
+        if existing_size > 0:
+
+            print(
+                f"[{peer}] Hashing existing "
+                f"partial file..."
+            )
+
+            with open(
+                part_path,
+                "rb",
+            ) as f:
+
+                while chunk := f.read(
+                    CHUNK_SIZE
+                ):
+
+                    update_hash(
+                        hasher,
+                        chunk,
+                    )
+
+        # ====================================================
+        # STEP 5: Receive remaining data
+        # ====================================================
+
+        received = existing_size
+
+        with open(
+            part_path,
+            "ab",
+        ) as f:
+
+            while received < file_size:
+
+                remaining = (
+                    file_size - received
+                )
+
+                chunk = await reader.read(
+                    min(
+                        CHUNK_SIZE,
+                        remaining,
+                    )
                 )
 
                 if not chunk:
+
                     raise ConnectionError(
-                        "Client closed connection during file transfer"
+                        "Client disconnected "
+                        "during transfer"
                     )
 
-                f.write(chunk) #Jo chunk network se aaya, disk par write kar diya.
+                f.write(chunk)
 
-                file_hash.update(chunk) #Same data SHA-256 calculation mein bhi add kar diya.
-
-                received += len(chunk) # Total received bytes update kar diya.
-
-                print(
-                    f"[{peer}] Received: "
-                    f"{received}/{file_size} bytes"
+                # Update SHA-256 incrementally.
+                update_hash(
+                    hasher,
+                    chunk,
                 )
 
-        # -----------------------------------------
-        # STEP 3: Final checksum
-        # -----------------------------------------
+                received += len(chunk)
 
-        server_hash = file_hash.hexdigest() #Transfer complete hone ke baad final hash.
+                print(
+                    f"[{peer}] "
+                    f"Received "
+                    f"{received}/{file_size} "
+                    f"bytes"
+                )
 
-        print(f"[{peer}] Server SHA-256: {server_hash}")
-        print(f"[{peer}] File received successfully")
+        # ====================================================
+        # STEP 6: Receive client SHA-256
+        # ====================================================
 
-    except asyncio.IncompleteReadError: #Asyncio mein agar client ne connection close kar diya aur expected bytes receive nahi hue, to ye exception aayega.
-        print(f"[{peer}] Client closed connection early")
+        server_hash = get_digest(
+            hasher
+        )
 
-    except ConnectionError as e: #Agar connection mein koi problem aaye, jaise client ne beech mein connection close kar diya.
-        print(f"[{peer}] Connection error: {e}")
+        client_hash = (
+            await read_final_hash(
+                reader
+            )
+        )
+
+        print(
+            f"[{peer}] Server SHA-256: "
+            f"{server_hash}"
+        )
+
+        print(
+            f"[{peer}] Client SHA-256: "
+            f"{client_hash}"
+        )
+
+        # ====================================================
+        # STEP 7: Verify checksum
+        # ====================================================
+
+        if server_hash != client_hash:
+
+            print(
+                f"[{peer}] "
+                f"CHECKSUM MISMATCH"
+            )
+
+            if part_path.exists():
+
+                part_path.unlink()
+
+            writer.write(
+                pack_status(
+                    STATUS_CHECKSUM_MISMATCH
+                )
+            )
+
+            await writer.drain()
+
+            return
+
+        # ====================================================
+        # STEP 8: Transfer successful
+        # ====================================================
+
+        os.replace(
+            part_path,
+            final_path,
+        )
+
+        print(
+            f"[{peer}] "
+            f"Transfer completed successfully"
+        )
+
+        print(
+            f"[{peer}] Saved to: "
+            f"{final_path}"
+        )
+
+        writer.write(
+            pack_status(
+                STATUS_OK
+            )
+        )
+
+        await writer.drain()
+
+    # ========================================================
+    # Expected incomplete transfer
+    # ========================================================
+
+    except asyncio.IncompleteReadError:
+
+        # IMPORTANT:
+        # Keep .part file so next connection can resume.
+
+        print(
+            f"[{peer}] "
+            f"Client disconnected early"
+        )
+
+    # ========================================================
+    # Connection errors
+    # ========================================================
+
+    except ConnectionError as e:
+
+        print(
+            f"[{peer}] "
+            f"Connection error: {e}"
+        )
+
+    # ========================================================
+    # Invalid request
+    # ========================================================
+
+    except ValueError as e:
+
+        print(
+            f"[{peer}] "
+            f"Invalid request: {e}"
+        )
+
+        try:
+
+            writer.write(
+                pack_status(
+                    STATUS_INVALID_REQUEST
+                )
+            )
+
+            await writer.drain()
+
+        except Exception:
+            pass
+
+    # ========================================================
+    # Unexpected error
+    # ========================================================
+
+    except Exception as e:
+
+        print(
+            f"[{peer}] "
+            f"Unexpected error: {e}"
+        )
+
+    # ========================================================
+    # Cleanup
+    # ========================================================
 
     finally:
+
         writer.close()
+
         await writer.wait_closed()
 
-        print(f"[{peer}] Connection closed")
+        print(
+            f"[{peer}] "
+            f"Connection closed"
+        )
 
 
-async def main(): #main function
+# ============================================================
+# Main server
+# ============================================================
 
-    server = await asyncio.start_server( #"5050 par server start karo, aur jab client aaye to handle_client use karo."
+async def main():
+
+    server = await asyncio.start_server(
         handle_client,
         HOST,
-        PORT
+        PORT,
     )
 
-    print(f"Async server listening on {HOST}:{PORT}")
+    print(
+        f"Reliable async server listening "
+        f"on {HOST}:{PORT}"
+    )
 
     async with server:
-        await server.serve_forever() #Server chalta rahe aur incoming clients handle karta rahe.
+
+        await server.serve_forever()
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
