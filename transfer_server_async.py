@@ -1,19 +1,16 @@
 import asyncio
-import os #File ko rename/replace karne ke liye:
-from pathlib import Path #File paths ko cleanly handle karne ke liye:
+import os
+from pathlib import Path
 
 from protocol import (
     PING,
     PONG,
     START_TRANSFER,
-
     read_transfer_start,
     pack_resume_offset,
     read_final_hash,
     pack_status,
-
     pack_pong,
-
     STATUS_OK,
     STATUS_CHECKSUM_MISMATCH,
     STATUS_INVALID_REQUEST,
@@ -31,8 +28,8 @@ PORT = 5050
 
 CHUNK_SIZE = 4096
 
-TRANSFER_DIR = Path("transfers") #"Saari incoming transfer files transfers/ folder mein rakho."
-TRANSFER_DIR.mkdir(exist_ok=True)   #iska matlb hai ki agar transfers/ folder pehle se exist karta hai toh kuch nahi hoga, aur agar exist nahi karta toh ye folder create kar dega.
+TRANSFER_DIR = Path("transfers")
+TRANSFER_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
@@ -45,7 +42,7 @@ def sanitize_transfer_id(transfer_id):
         c
         for c in transfer_id
         if c.isalnum() or c in "-_"
-    ) #Means ki transfer_id mein sirf alphanumeric characters aur '-' ya '_' allowed hain. Agar koi aur character hai toh wo remove ho jayega.
+    )
 
     if not safe_id:
         raise ValueError(
@@ -80,7 +77,7 @@ def get_paths(transfer_id):
 
 async def handle_client(reader, writer):
 
-    peer = writer.get_extra_info( #Ye client ka address/port information nikaalta hai.
+    peer = writer.get_extra_info(
         "peername"
     )
 
@@ -114,12 +111,7 @@ async def handle_client(reader, writer):
                 f"[{peer}] PING -> PONG"
             )
 
-            # IMPORTANT:
-            # Do NOT close.
-            #
-            # Client will now send START_TRANSFER
-            # on the SAME TCP connection.
-
+            # Keep same TCP connection alive.
             first_byte = await reader.readexactly(1)
 
             message_type = first_byte[0]
@@ -134,7 +126,7 @@ async def handle_client(reader, writer):
                 "Expected START_TRANSFER message"
             )
 
-        # Reconstruct the complete START_TRANSFER header.
+        # Reconstruct complete START_TRANSFER header.
         transfer_id, file_size = (
             await read_transfer_start(
                 reader,
@@ -259,7 +251,6 @@ async def handle_client(reader, writer):
 
                 f.write(chunk)
 
-                # Update SHA-256 incrementally.
                 update_hash(
                     hasher,
                     chunk,
@@ -310,7 +301,6 @@ async def handle_client(reader, writer):
             )
 
             if part_path.exists():
-
                 part_path.unlink()
 
             writer.write(
@@ -356,7 +346,6 @@ async def handle_client(reader, writer):
 
     except asyncio.IncompleteReadError:
 
-        # IMPORTANT:
         # Keep .part file so next connection can resume.
 
         print(

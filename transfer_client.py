@@ -27,11 +27,16 @@ from metrics import (
     append_result,
 )
 
+from adaptive import (
+    choose_chunk_size,
+    LOW_RTT_THRESHOLD_MS,
+    NORMAL_CHUNK_SIZE,
+    HIGH_RTT_CHUNK_SIZE,
+)
+
 
 HOST = "127.0.0.1"
 PORT = 5050
-
-CHUNK_SIZE = 4096
 
 
 # ============================================================
@@ -39,19 +44,7 @@ CHUNK_SIZE = 4096
 # ============================================================
 
 async def measure_rtt(reader, writer):
-    """
-    Application-level RTT probe.
-
-    The TCP connection is already established.
-
-    We send:
-        PING
-
-    Server replies:
-        PONG
-
-    RTT is measured between those two application messages.
-    """
+    """Measure application-level RTT using one PING/PONG exchange."""
 
     start = time.perf_counter()
 
@@ -80,6 +73,7 @@ async def transfer_once(
     fail_after_chunks=0,
     corrupt=False,
     condition="baseline",
+    adaptive=True,
 ):
     file_size = os.path.getsize(file_path)
 
@@ -108,7 +102,52 @@ async def transfer_once(
         )
 
         # ====================================================
-        # STEP 2: Send transfer information
+        # STEP 2: Adaptive decision
+        # ====================================================
+
+        if adaptive:
+            chunk_size = choose_chunk_size(rtt_ms)
+
+            if rtt_ms < LOW_RTT_THRESHOLD_MS:
+                reason = (
+                    f"RTT < {LOW_RTT_THRESHOLD_MS:.0f} ms"
+                )
+            else:
+                reason = (
+                    f"RTT >= {LOW_RTT_THRESHOLD_MS:.0f} ms"
+                )
+
+            print(
+                "Adaptive mode: ON"
+            )
+
+            print(
+                f"Adaptive decision: "
+                f"chunk_size={chunk_size} bytes "
+                f"({chunk_size / 1024:.0f} KB), "
+                f"reason={reason}"
+            )
+
+        else:
+
+            chunk_size = NORMAL_CHUNK_SIZE
+
+            print("Adaptive mode: OFF")
+
+            print(
+                f"Using fixed chunk size: "
+                f"{chunk_size} bytes "
+                f"({chunk_size / 1024:.0f} KB)"
+            )
+
+        # Sanity check
+        assert chunk_size in {
+            NORMAL_CHUNK_SIZE,
+            HIGH_RTT_CHUNK_SIZE,
+        }
+
+        # ====================================================
+        # STEP 3: Send transfer information
         # ====================================================
 
         start_message = pack_transfer_start(
@@ -117,13 +156,19 @@ async def transfer_once(
         )
 
         writer.write(start_message)
+
         await writer.drain()
 
-        print(f"Transfer ID: {transfer_id}")
-        print(f"File size: {file_size} bytes")
+        print(
+            f"Transfer ID: {transfer_id}"
+        )
+
+        print(
+            f"File size: {file_size} bytes"
+        )
 
         # ====================================================
-        # STEP 3: Receive resume offset
+        # STEP 4: Receive resume offset
         # ====================================================
 
         resume_message = await reader.readexactly(9)
@@ -147,15 +192,19 @@ async def transfer_once(
         )
 
         # ====================================================
-        # STEP 4: Create SHA-256 hasher
+        # STEP 5: Create SHA-256 hasher
         # ====================================================
 
         hasher = create_hasher()
 
-        # Hash bytes that server already has.
+        # Hash bytes already present on server.
+
         if offset > 0:
 
-            with open(file_path, "rb") as f:
+            with open(
+                file_path,
+                "rb"
+            ) as f:
 
                 remaining = offset
 
@@ -163,7 +212,7 @@ async def transfer_once(
 
                     chunk = f.read(
                         min(
-                            CHUNK_SIZE,
+                            chunk_size,
                             remaining,
                         )
                     )
@@ -182,7 +231,7 @@ async def transfer_once(
                     remaining -= len(chunk)
 
         # ====================================================
-        # STEP 5: Send remaining file
+        # STEP 6: Send remaining file
         # ====================================================
 
         sent = offset
@@ -192,16 +241,17 @@ async def transfer_once(
         transfer_start = None
         transfer_end = None
 
-        with open(file_path, "rb") as f:
+        with open(
+            file_path,
+            "rb"
+        ) as f:
 
             f.seek(offset)
 
-            # Start performance measurement
-            # immediately before payload transfer.
             if offset < file_size:
                 transfer_start = time.perf_counter()
 
-            while chunk := f.read(CHUNK_SIZE):
+            while chunk := f.read(chunk_size):
 
                 original_chunk = chunk
                 chunk_to_send = chunk
@@ -216,7 +266,9 @@ async def transfer_once(
 
                     corrupted[0] ^= 0xFF
 
-                    chunk_to_send = bytes(corrupted)
+                    chunk_to_send = bytes(
+                        corrupted
+                    )
 
                     corruption_done = True
 
@@ -225,22 +277,26 @@ async def transfer_once(
                         "before sending"
                     )
 
-                writer.write(chunk_to_send)
+                writer.write(
+                    chunk_to_send
+                )
 
                 await writer.drain()
 
-                # IMPORTANT:
-                # Hash ORIGINAL data, not corrupted data.
+                # Hash ORIGINAL data,
+                # not corrupted data.
                 update_hash(
                     hasher,
                     original_chunk,
                 )
 
                 sent += len(chunk)
+
                 chunks_sent += 1
 
                 print(
-                    f"Sent: {sent}/{file_size} bytes"
+                    f"Sent: "
+                    f"{sent}/{file_size} bytes"
                 )
 
                 # --------------------------------------------
@@ -258,6 +314,7 @@ async def transfer_once(
                     )
 
                     writer.close()
+
                     await writer.wait_closed()
 
                     raise ConnectionError(
@@ -268,7 +325,7 @@ async def transfer_once(
                 transfer_end = time.perf_counter()
 
         # ====================================================
-        # STEP 6: Calculate transfer metrics
+        # STEP 7: Calculate transfer metrics
         # ====================================================
 
         bytes_transferred = file_size - offset
@@ -283,11 +340,9 @@ async def transfer_once(
         else:
             transfer_duration = 0.0
 
-        throughput_mbps = (
-            calculate_throughput_mbps(
-                bytes_transferred,
-                transfer_duration,
-            )
+        throughput_mbps = calculate_throughput_mbps(
+            bytes_transferred,
+            transfer_duration,
         )
 
         print(
@@ -301,27 +356,31 @@ async def transfer_once(
         )
 
         # ====================================================
-        # STEP 7: Calculate final SHA-256
+        # STEP 8: Calculate final SHA-256
         # ====================================================
 
-        final_hash = get_digest(hasher)
+        final_hash = get_digest(
+            hasher
+        )
 
         print(
             f"Client SHA-256: {final_hash}"
         )
 
         # ====================================================
-        # STEP 8: Send final hash
+        # STEP 9: Send final hash
         # ====================================================
 
         writer.write(
-            pack_final_hash(final_hash)
+            pack_final_hash(
+                final_hash
+            )
         )
 
         await writer.drain()
 
         # ====================================================
-        # STEP 9: Receive server result
+        # STEP 10: Receive server result
         # ====================================================
 
         status_message = await reader.readexactly(2)
@@ -331,7 +390,6 @@ async def transfer_once(
         )
 
         if status != STATUS_OK:
-
             raise ValueError(
                 f"Server rejected transfer. "
                 f"Status={status}"
@@ -342,7 +400,7 @@ async def transfer_once(
         )
 
         # ====================================================
-        # STEP 10: Save metrics
+        # STEP 11: Save metrics
         # ====================================================
 
         append_result(
@@ -380,6 +438,7 @@ async def transfer_with_retry(
     transfer_id,
     corrupt,
     condition,
+    adaptive,
 ):
 
     print(
@@ -394,6 +453,7 @@ async def transfer_with_retry(
             fail_after_chunks,
             corrupt,
             condition,
+            adaptive,
         )
 
     return await retry(
@@ -411,7 +471,7 @@ async def transfer_with_retry(
 async def main():
 
     parser = argparse.ArgumentParser(
-        description="Reliable TCP file transfer client"
+        description="Reliable adaptive TCP file transfer client"
     )
 
     parser.add_argument(
@@ -460,6 +520,12 @@ async def main():
         help="Network experiment condition",
     )
 
+    parser.add_argument(
+        "--no-adaptive",
+        action="store_true",
+        help="Disable the RTT-based adaptive chunk-size rule",
+    )
+
     args = parser.parse_args()
 
     transfer_id = (
@@ -475,6 +541,7 @@ async def main():
         transfer_id,
         args.corrupt,
         args.condition,
+        not args.no_adaptive,
     )
 
 
